@@ -1,34 +1,46 @@
 // compute_powerset.c
 //
-// C port of the Python multiprocess structure, but writes compact distributions.
+// Computes distributions of (|A|, |A+A|, |A*A|) over all nonempty A ⊆ [n].
 //
-// MODS:
-//  1) Store counts keyed by (set_cardinality=|A|, add_ds_card=|A+A|, mult_ds_card=|A*A|).
-//  2) Speed-ups without compromising accuracy:
-//     - Limit concurrency to <= jobs processes at a time (prevents oversubscription when jobs*k >> jobs).
-//     - Faster Gray walk update: use the known property that the toggled Gray bit at step t is CTZ(t).
-//       (avoids recomputing gray(t) and diff each iteration).
-//     - Faster removal update: remove x from the list first to avoid "if (y==x)" branch in the loop.
-//     - Avoid unnecessary membership bookkeeping; keep only elems[] and pos[].
-//     - Use 64-bit counters (counts can exceed 2^32).
-//     - Keep a sparse "touched bins" list to avoid scanning the entire 3D table on output.
+// Key speed/memory changes implemented:
+//  (1) Counts table shrunk using the unconditional bound |A*A| ≤ C(|A|+1,2).
+//      So for each k=|A| we only allocate mult ∈ [0..k(k+1)/2] instead of [0..n^2].
+//  (2) Output is written in a compact binary format (native endianness) instead of CSV;
+//      convert to CSV later with a separate pass.
+//
+// Other performance features kept:
+//  - Gray-code walk with O(1) toggled-bit update: toggled bit at step t is CTZ(t).
+//  - Incremental maintenance of add/mult cardinalities via ordered-pair reps.
+//  - Concurrency capped to <= jobs processes (even if total_tasks = jobs*k is larger).
+//  - Sparse “touched bins” list to avoid scanning the full table on output.
 //
 // Usage:
 //   ./compute_powerset <n> <out_dir> <jobs> <k>
 //
 // Output files:
-//   <out_dir>/pairs_<n>_<file_id:04d>.csv   where file_id = chunk_id + 1
+//   <out_dir>/pairs_<n>_<file_id:04d>.bin   where file_id = chunk_id + 1
 //
-// Output CSV columns:
-//   set_cardinality,add_ds_card,mult_ds_card,count
+// Binary format (native endianness):
+//   Header:
+//     char     magic[8]   = "SPP1BIN\0"
+//     uint8_t  version    = 1
+//     uint8_t  n
+//     uint16_t max_sum    = 2n
+//     uint32_t record_cnt = number of records
+//   Records (record_cnt times):
+//     uint8_t  set_cardinality  (k)
+//     uint8_t  add_ds_card      (|A+A|)
+//     uint16_t mult_ds_card     (|A*A|)
+//     uint64_t count
 //
 // Notes:
-// - Subsets are represented as uint64 bitmasks, so requires 1 <= n <= 63.
-// - Enumerates all nonempty subsets of [n] (skips A=∅).
-// - total_tasks = jobs*k chunks, but runs at most "jobs" chunks concurrently.
+// - Subsets represented as uint64 masks; requires 1 <= n <= 63.
+// - Enumerates all nonempty subsets of [n].
+// - For n up to ~51 this is still computationally enormous; your aim (“a few days”) is realistic
+//   only with substantial parallel hardware and/or multiple machines.
 //
 // Compile (recommended):
-//   gcc -O3 -march=native -flto -fno-plt -std=c11 -Wall -Wextra -o compute_powerset compute_powerset.c
+//   gcc -O3 -march=native -flto -fno-plt -std=c11 -Wall -Wextra -Wpedantic -pipe -DNDEBUG -o compute_powerset compute_powerset.c
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -104,7 +116,6 @@ static inline uint64_t gray64(uint64_t t) { return t ^ (t >> 1); }
    Incremental rep tracking
    ============================================================ */
 
-// Maintain a dynamic list of elements in A for O(|A|) iteration and O(1) delete.
 typedef struct {
     uint8_t elems[63]; // values 1..63
     uint8_t pos[64];   // pos[x] valid when x in set
@@ -113,7 +124,6 @@ typedef struct {
 
 static inline void setlist_init(SetList *S) {
     S->m = 0;
-    // pos[] only needs to be correct for present elements; still initialize for safety.
     for (int i = 0; i < 64; i++) S->pos[i] = 0;
 }
 
@@ -131,7 +141,7 @@ static inline void setlist_remove(SetList *S, uint8_t x) {
     S->m = last_i;
 }
 
-// Specialized rep updates (delta is always 2 or 1).
+// rep updates; deltas are always 2 or 1
 static inline void rep_inc2_u16(uint16_t *rep, int idx, int *card) {
     uint16_t before = rep[idx];
     rep[idx] = (uint16_t)(before + 2u);
@@ -153,8 +163,6 @@ static inline void rep_dec1_u16(uint16_t *rep, int idx, int *card) {
     if (after == 0) (*card)--;
 }
 
-// Ordered-pair reps: when adding x, for each y in A(before):
-// (x,y) and (y,x): +2; plus (x,x): +1.
 static inline void add_element(SetList *S, uint8_t x,
                                uint16_t * __restrict rep_sum,
                                uint16_t * __restrict rep_prod,
@@ -170,19 +178,16 @@ static inline void add_element(SetList *S, uint8_t x,
     setlist_add(S, x);
 }
 
-// Faster remove: remove x from S first so we can loop without a branch.
+// remove (x,x), then remove x from set, then loop without a branch
 static inline void remove_element(SetList *S, uint8_t x,
                                   uint16_t * __restrict rep_sum,
                                   uint16_t * __restrict rep_prod,
                                   int *add_card, int *mult_card) {
-    // Remove (x,x)
     rep_dec1_u16(rep_sum,  2 * (int)x, add_card);
     rep_dec1_u16(rep_prod, (int)x * (int)x, mult_card);
 
-    // Remove x from the list (now S contains A \ {x})
     setlist_remove(S, x);
 
-    // Remove (x,y) and (y,x) for all remaining y
     const int m = S->m;
     for (int i = 0; i < m; i++) {
         uint8_t y = S->elems[i];
@@ -192,7 +197,7 @@ static inline void remove_element(SetList *S, uint8_t x,
 }
 
 /* ============================================================
-   Sparse "touched bins" vector to speed output
+   Sparse touched-bins vector
    ============================================================ */
 
 typedef struct {
@@ -226,52 +231,102 @@ static inline void u32vec_free(U32Vec *v) {
     v->len = v->cap = 0;
 }
 
+// Pack (k, add, mult) into 32 bits.
+// k <= 63, add <= 126, mult <= 3969 (< 4096).
+static inline uint32_t pack_key(uint8_t k, uint8_t add, uint16_t mult) {
+    return ((uint32_t)k << 19) | ((uint32_t)add << 12) | (uint32_t)mult;
+}
+static inline void unpack_key(uint32_t key, uint8_t *k, uint8_t *add, uint16_t *mult) {
+    *k    = (uint8_t)(key >> 19);
+    *add  = (uint8_t)((key >> 12) & 0x7Fu);
+    *mult = (uint16_t)(key & 0x0FFFu);
+}
+
+/* ============================================================
+   Binary output structs (packed)
+   ============================================================ */
+
+#if defined(__GNUC__) || defined(__clang__)
+  #define PACKED __attribute__((packed))
+#else
+  #define PACKED
+#endif
+
+typedef struct PACKED {
+    char     magic[8];    // "SPP1BIN\0"
+    uint8_t  version;     // 1
+    uint8_t  n;           // n
+    uint16_t max_sum;     // 2n
+    uint32_t record_cnt;  // number of records
+} BinHeader;
+
+typedef struct PACKED {
+    uint8_t  k;
+    uint8_t  add;
+    uint16_t mult;
+    uint64_t count;
+} BinRec;
+
 /* ============================================================
    Per-chunk worker
    ============================================================ */
 
 static int run_task(int chunk_id, int n, int total_tasks, const char *out_dir) {
-    // total = 2^n (n<=63). Use 128-bit for partition arithmetic to avoid overflow.
+    // Partition [0,2^n) into contiguous blocks.
     const __uint128_t TOTAL = (((__uint128_t)1) << n);
-
-    const int max_sum  = 2 * n;     // indices 0..2n (we'll only hit >=2)
-    const int max_prod = n * n;     // indices 0..n^2 (we'll only hit >=1)
-
-    // 3D dense distribution:
-    // idx = k * plane + add * stride + mult
-    const size_t stride   = (size_t)(max_prod + 1);        // mult dimension
-    const size_t sum_span = (size_t)(max_sum + 1);         // add dimension
-    const size_t plane    = sum_span * stride;             // per k plane
-    const size_t table_sz = (size_t)(n + 1) * plane;       // all k
-
-    uint64_t *counts = (uint64_t *)calloc(table_sz, sizeof(uint64_t));
-    if (!counts) {
-        fprintf(stderr, "Task %d: failed to allocate counts table (%zu entries)\n", chunk_id, table_sz);
-        return 2;
-    }
-
-    // Track which bins become nonzero (to avoid scanning all of counts on output).
-    U32Vec touched;
-    if (u32vec_init(&touched, (size_t)1 << 20) != 0) { // start at ~1M bins, grow as needed
-        fprintf(stderr, "Task %d: failed to allocate touched vector\n", chunk_id);
-        free(counts);
-        return 2;
-    }
-
     const uint64_t start = (uint64_t)((TOTAL * (unsigned)chunk_id) / (unsigned)total_tasks);
     const uint64_t end   = (uint64_t)((TOTAL * (unsigned)(chunk_id + 1)) / (unsigned)total_tasks);
 
-    // Rep counts for ordered pairs.
-    uint16_t rep_sum[127]; // max is 2*63 = 126
+    const int max_sum  = 2 * n;
+    const int max_prod = n * n;
+
+    // Per-k mult caps: mult_cap[k] = k(k+1)/2.
+    // Strides and offsets for the shrunk counts array:
+    // counts stores, for each k, a (max_sum+1) x (mult_cap[k]+1) slab.
+    uint16_t *stride_k = (uint16_t *)malloc((size_t)(n + 1) * sizeof(uint16_t));
+    size_t   *offset_k = (size_t   *)malloc((size_t)(n + 1) * sizeof(size_t));
+    if (!stride_k || !offset_k) {
+        fprintf(stderr, "Task %d: failed to allocate stride/offset arrays\n", chunk_id);
+        free(stride_k); free(offset_k);
+        return 2;
+    }
+
+    size_t sum_strides = 0;
+    for (int k = 0; k <= n; k++) {
+        const int cap = (k * (k + 1)) / 2;  // <= max_prod always for k<=n
+        stride_k[k] = (uint16_t)(cap + 1);
+        offset_k[k] = (size_t)(max_sum + 1) * sum_strides;
+        sum_strides += (size_t)stride_k[k];
+    }
+
+    const size_t total_bins = (size_t)(max_sum + 1) * sum_strides;
+
+    uint64_t *counts = (uint64_t *)calloc(total_bins, sizeof(uint64_t));
+    if (!counts) {
+        fprintf(stderr, "Task %d: failed to allocate counts table (%zu bins)\n", chunk_id, total_bins);
+        free(stride_k); free(offset_k);
+        return 2;
+    }
+
+    U32Vec touched;
+    // Preallocate moderately; will grow if needed.
+    if (u32vec_init(&touched, (size_t)1 << 20) != 0) {
+        fprintf(stderr, "Task %d: failed to allocate touched vector\n", chunk_id);
+        free(counts);
+        free(stride_k); free(offset_k);
+        return 2;
+    }
+
+    // Representation counts for ordered pairs.
+    uint16_t rep_sum[127]; // up to 2*63
     for (int i = 0; i <= max_sum; i++) rep_sum[i] = 0;
 
-    // rep_prod size max_prod+1; VLA is fine (<= 3970 for n<=63)
+    // Products in [0..n^2]
     uint16_t rep_prod[max_prod + 1];
     memset(rep_prod, 0, (size_t)(max_prod + 1) * sizeof(uint16_t));
 
     SetList S;
     setlist_init(&S);
-
     int add_card = 0;
     int mult_card = 0;
 
@@ -279,34 +334,48 @@ static int run_task(int chunk_id, int n, int total_tasks, const char *out_dir) {
     uint64_t g = gray64(start);
     uint64_t mm = g;
     while (mm) {
-        unsigned bit = (unsigned)CTZ64(mm);     // 0..n-1
-        uint8_t x = (uint8_t)(bit + 1);         // 1..n
+        unsigned bit = (unsigned)CTZ64(mm);
+        uint8_t x = (uint8_t)(bit + 1);
         mm &= (mm - 1);
         add_element(&S, x, rep_sum, rep_prod, &add_card, &mult_card);
     }
 
     // Record start (skip empty set)
     if (g != 0) {
-        const int k = S.m;
-        const size_t idx = (size_t)k * plane + (size_t)add_card * stride + (size_t)mult_card;
+        const uint8_t k = (uint8_t)S.m;
+
+        // Safety: mult_card must be <= k(k+1)/2
+        const int cap = ((int)k * ((int)k + 1)) / 2;
+        if (mult_card > cap) {
+            fprintf(stderr, "Task %d: invariant violated at init: mult_card=%d > C(k+1,2)=%d\n",
+                    chunk_id, mult_card, cap);
+            u32vec_free(&touched);
+            free(counts);
+            free(stride_k); free(offset_k);
+            return 2;
+        }
+
+        const size_t idx = offset_k[k] + (size_t)add_card * (size_t)stride_k[k] + (size_t)mult_card;
         uint64_t *c = &counts[idx];
         if ((*c)++ == 0) {
-            if (u32vec_push(&touched, (uint32_t)idx) != 0) {
+            const uint32_t key = pack_key(k, (uint8_t)add_card, (uint16_t)mult_card);
+            if (u32vec_push(&touched, key) != 0) {
                 fprintf(stderr, "Task %d: touched push failed\n", chunk_id);
                 u32vec_free(&touched);
                 free(counts);
+                free(stride_k); free(offset_k);
                 return 2;
             }
         }
     }
 
-    // Walk forward in Gray order over the contiguous t-range [start, end).
-    // Speed-up: For reflected Gray code g(t)=t^(t>>1), the toggled bit from t-1 -> t is CTZ(t).
+    // Walk forward in Gray order over [start+1, end).
+    // For reflected Gray code g(t)=t^(t>>1), the toggled bit from t-1->t is CTZ(t).
     for (uint64_t t = start + 1; t < end; t++) {
-        unsigned bit = (unsigned)CTZ64(t);      // toggled bit index
+        unsigned bit = (unsigned)CTZ64(t);
         uint64_t bmask = 1ULL << bit;
 
-        g ^= bmask;                             // update Gray code in O(1)
+        g ^= bmask;
         uint8_t x = (uint8_t)(bit + 1);
 
         if (g & bmask) {
@@ -316,52 +385,94 @@ static int run_task(int chunk_id, int n, int total_tasks, const char *out_dir) {
         }
 
         if (g != 0) {
-            const int k = S.m;
-            const size_t idx = (size_t)k * plane + (size_t)add_card * stride + (size_t)mult_card;
+            const uint8_t k = (uint8_t)S.m;
+            const int cap = ((int)k * ((int)k + 1)) / 2;
+            if (mult_card > cap) {
+                fprintf(stderr, "Task %d: invariant violated: mult_card=%d > C(k+1,2)=%d\n",
+                        chunk_id, mult_card, cap);
+                u32vec_free(&touched);
+                free(counts);
+                free(stride_k); free(offset_k);
+                return 2;
+            }
+
+            const size_t idx = offset_k[k] + (size_t)add_card * (size_t)stride_k[k] + (size_t)mult_card;
             uint64_t *c = &counts[idx];
             if ((*c)++ == 0) {
-                if (u32vec_push(&touched, (uint32_t)idx) != 0) {
+                const uint32_t key = pack_key(k, (uint8_t)add_card, (uint16_t)mult_card);
+                if (u32vec_push(&touched, key) != 0) {
                     fprintf(stderr, "Task %d: touched push failed\n", chunk_id);
                     u32vec_free(&touched);
                     free(counts);
+                    free(stride_k); free(offset_k);
                     return 2;
                 }
             }
         }
     }
 
-    // Write CSV (sparse by touched bins)
+    // Write binary output
     const int file_id = chunk_id + 1;
     char path[4096];
-    snprintf(path, sizeof(path), "%s/pairs_%d_%04d.csv", out_dir, n, file_id);
+    snprintf(path, sizeof(path), "%s/pairs_%d_%04d.bin", out_dir, n, file_id);
 
-    FILE *f = fopen(path, "w");
+    FILE *f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "Task %d: failed to open output file %s: %s\n", chunk_id, path, strerror(errno));
         u32vec_free(&touched);
         free(counts);
+        free(stride_k); free(offset_k);
         return 3;
     }
 
-    fprintf(f, "set_cardinality,add_ds_card,mult_ds_card,count\n");
+    BinHeader hdr;
+    memset(&hdr, 0, sizeof(hdr));
+    memcpy(hdr.magic, "SPP1BIN\0", 8);
+    hdr.version = 1;
+    hdr.n = (uint8_t)n;
+    hdr.max_sum = (uint16_t)max_sum;
+    hdr.record_cnt = (uint32_t)touched.len;
 
-    // Note: output order is traversal order of first-hit bins (not sorted).
+    if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) {
+        fprintf(stderr, "Task %d: failed to write header to %s\n", chunk_id, path);
+        fclose(f);
+        u32vec_free(&touched);
+        free(counts);
+        free(stride_k); free(offset_k);
+        return 3;
+    }
+
     for (size_t i = 0; i < touched.len; i++) {
-        const size_t idx = (size_t)touched.data[i];
+        uint8_t k, a;
+        uint16_t m;
+        unpack_key(touched.data[i], &k, &a, &m);
+
+        // Lookup count
+        const size_t idx = offset_k[k] + (size_t)a * (size_t)stride_k[k] + (size_t)m;
         const uint64_t c = counts[idx];
 
-        // Decode idx -> (k, add, mult)
-        const size_t k   = idx / plane;
-        const size_t rem = idx - k * plane;
-        const size_t a   = rem / stride;
-        const size_t m   = rem - a * stride;
+        BinRec rec;
+        rec.k = k;
+        rec.add = a;
+        rec.mult = m;
+        rec.count = c;
 
-        fprintf(f, "%zu,%zu,%zu,%" PRIu64 "\n", k, a, m, c);
+        if (fwrite(&rec, sizeof(rec), 1, f) != 1) {
+            fprintf(stderr, "Task %d: failed to write record to %s\n", chunk_id, path);
+            fclose(f);
+            u32vec_free(&touched);
+            free(counts);
+            free(stride_k); free(offset_k);
+            return 3;
+        }
     }
 
     fclose(f);
+
     u32vec_free(&touched);
     free(counts);
+    free(stride_k);
+    free(offset_k);
     return 0;
 }
 
@@ -411,7 +522,6 @@ int main(int argc, char **argv) {
     int active = 0;
     int done = 0;
 
-    // Launch up to "jobs" processes at a time.
     while (done < total_tasks) {
         while (active < jobs && next_chunk < total_tasks) {
             const int chunk_id = next_chunk;
@@ -419,8 +529,7 @@ int main(int argc, char **argv) {
             pid_t pid = fork();
             if (pid < 0) {
                 fprintf(stderr, "Error: fork failed at chunk %d: %s\n", chunk_id, strerror(errno));
-                // stop launching new children; we'll just wait for the active ones
-                next_chunk = total_tasks;
+                next_chunk = total_tasks; // stop launching; wait for the active ones
                 break;
             }
             if (pid == 0) {
@@ -443,7 +552,6 @@ int main(int argc, char **argv) {
         active--;
         done++;
 
-        // Find chunk_id for this pid (linear scan is fine; total_tasks is small).
         int chunk_id = -1;
         for (int i = 0; i < total_tasks; i++) {
             if (pids[i] == pid) { chunk_id = i; break; }
@@ -455,7 +563,7 @@ int main(int argc, char **argv) {
 
         const int file_id = (chunk_id >= 0) ? (chunk_id + 1) : 0;
         char path[4096];
-        snprintf(path, sizeof(path), "%s/pairs_%d_%04d.csv", out_dir, n, file_id);
+        snprintf(path, sizeof(path), "%s/pairs_%d_%04d.bin", out_dir, n, file_id);
 
         double elapsed = now_seconds() - t0;
         int pct = (100 * done) / total_tasks;
