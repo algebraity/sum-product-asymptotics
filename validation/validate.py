@@ -11,8 +11,8 @@ for fn in os.listdir(d):
         with open(os.path.join(d, fn), newline="", encoding="utf-8") as f:
             r = csv.reader(f); next(r, None)
             for row in r:
-                if not row[2] == "count":
-                    total += int(row[2])
+                if not row[3] == "count":
+                    total += int(row[3])
 
 print(total == (2**int(n) - 1))
 
