@@ -1,24 +1,20 @@
-// compute_spp_fixedk_up_to.c
+// compute_spp_fixedk_up_to_gmp_newonly.c
 //
-// Enumerate all k-subsets A of [N] (for N=k..N_max) and count pairs (|A+A|, |A*A|).
-// Writes a single merged CSV:  <out_dir>/spp_k_up_to_n.csv
+// Like compute_spp_fixedk_up_to_gmp.c, but for each N it scans only k-subsets A of [N]
+// that contain an element > baseN (e.g. baseN=45).
+//
+// Key idea: In lex order, the first C(baseN,k) k-subsets of [N] are exactly the k-subsets of [baseN].
+// So we skip those ranks entirely by adding an offset to the unranking rank.
 //
 // Usage:
-//   ./compute_spp_fixedk_up_to <N_max> <k> <out_dir> <jobs> <chunks_per_job>
+//   ./compute_spp_fixedk_up_to_gmp_newonly <N_max> <k> <out_dir> <jobs> <chunks_per_job> <baseN>
 //
-// Output CSV columns:
-//   N,set_cardinality,add_ds_card,mult_ds_card,count
+// Output CSV:
+//   <out_dir>/spp_k<k>/spp_k<k>_up_to_n<N_max>_new_gt_<baseN>.csv
 //
-// Notes:
-// - Uses multi-process chunking: total_tasks = jobs * chunks_per_job.
-// - Caps concurrency to <= jobs.
-// - Partitions combination ranks [0, C(N,k)) into contiguous ranges per task.
-// - For each subset, computes distinct sums/products via timestamped mark arrays
-//   (no expensive clearing).
-//
-// Compile (recommended):
+// Compile:
 //   gcc -O3 -march=native -flto -fno-plt -std=c11 -Wall -Wextra -Wpedantic -pipe -DNDEBUG \
-//       -o compute_spp_fixedk_up_to compute_spp_fixedk_up_to.c
+//     -o compute_spp_fixedk_up_to_gmp_newonly compute_spp_fixedk_up_to_gmp_newonly.c -lgmp
 
 #define _POSIX_C_SOURCE 200809L
 
@@ -34,15 +30,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#if defined(__GNUC__) || defined(__clang__)
-  #define CTZ64(x) __builtin_ctzll((unsigned long long)(x))
-#else
-static inline unsigned CTZ64(uint64_t x) {
-    unsigned c = 0;
-    while ((x & 1ULL) == 0ULL) { x >>= 1; c++; }
-    return c;
-}
-#endif
+#include <gmp.h>
 
 static double now_seconds(void) {
     struct timespec ts;
@@ -50,7 +38,6 @@ static double now_seconds(void) {
     return (double)ts.tv_sec + 1e-9 * (double)ts.tv_nsec;
 }
 
-// mkdir -p style
 static int mkdir_p(const char *path) {
     if (!path || !*path) return -1;
 
@@ -79,59 +66,47 @@ static int mkdir_p(const char *path) {
 }
 
 /* ============================================================
-   Binomial / combinadic utilities (uint64 safe for small k)
+   Combinations: unrank (mpz) + next (fast)
    ============================================================ */
 
-static uint64_t binom_u64(int n, int k) {
-    if (k < 0 || k > n) return 0;
-    if (k == 0 || k == n) return 1;
-    if (k > n - k) k = n - k;
-    __uint128_t res = 1;
-    for (int i = 1; i <= k; i++) {
-        res = res * (uint64_t)(n - k + i);
-        res /= (uint64_t)i;
-        if (res > UINT64_MAX) return 0; // overflow guard
-    }
-    return (uint64_t)res;
-}
-
-// Unrank the r-th k-combination of {1..N} in lex order.
-// Requires 0 <= r < C(N,k). Output is strictly increasing.
-static void unrank_comb_lex(int N, int k, uint64_t r, uint8_t *out) {
-    int x = 1;
-    for (int i = 0; i < k; i++) {
-        // choose out[i]
-        for (;;) {
-            uint64_t c = binom_u64(N - x, (k - 1) - i); // combos if we pick x at position i
-            // Explanation: fixing out[i]=x leaves choose k-1-i from {x+1..N} of size N-x
-            if (c == 0) c = 0; // (overflow impossible for our target regime)
-            if (r < c) {
-                out[i] = (uint8_t)x;
-                x++;
-                break;
-            } else {
-                r -= c;
-                x++;
-            }
-        }
-    }
-}
-
-// Next combination in lex order, in-place, for elements in [1..N].
-// Returns 1 if advanced, 0 if it was the last combination.
-static int next_comb_lex(uint8_t *a, int k, int N) {
+static int next_comb_lex_u16(uint16_t *a, int k, int N) {
     for (int i = k - 1; i >= 0; i--) {
-        if (a[i] < (uint8_t)(N - (k - 1 - i))) {
+        int limit = N - (k - 1 - i);
+        if ((int)a[i] < limit) {
             a[i]++;
-            for (int j = i + 1; j < k; j++) a[j] = (uint8_t)(a[j - 1] + 1);
+            for (int j = i + 1; j < k; j++) a[j] = (uint16_t)(a[j - 1] + 1);
             return 1;
         }
     }
     return 0;
 }
 
+static void unrank_comb_lex_mpz(int N, int k, const mpz_t r_in, uint16_t *out) {
+    mpz_t r, c;
+    mpz_init_set(r, r_in);
+    mpz_init(c);
+
+    int x = 1;
+    for (int i = 0; i < k; i++) {
+        for (;;) {
+            mpz_bin_uiui(c, (unsigned)(N - x), (unsigned)((k - 1) - i));
+            if (mpz_cmp(r, c) < 0) {
+                out[i] = (uint16_t)x;
+                x++;
+                break;
+            } else {
+                mpz_sub(r, r, c);
+                x++;
+            }
+        }
+    }
+
+    mpz_clear(r);
+    mpz_clear(c);
+}
+
 /* ============================================================
-   Touched vector (sparse output)
+   Sparse touched-bins vector
    ============================================================ */
 
 typedef struct {
@@ -165,7 +140,6 @@ static void u32vec_free(U32Vec *v) {
     v->len = v->cap = 0;
 }
 
-// pack (add, mult) into 32 bits. add <= 126, mult <= 4095 for k<=90-ish, but here k small.
 static inline uint32_t pack_am(uint16_t add, uint16_t mult) {
     return ((uint32_t)add << 12) | (uint32_t)(mult & 0x0FFFu);
 }
@@ -187,9 +161,8 @@ static inline void unpack_am(uint32_t key, uint16_t *add, uint16_t *mult) {
 typedef struct PACKED {
     char     magic[8];     // "SPPKBIN\0"
     uint8_t  version;      // 1
-    uint8_t  N;
-    uint8_t  k;
-    uint8_t  reserved;
+    uint16_t N;
+    uint16_t k;
     uint16_t max_sum;      // 2N
     uint16_t mult_cap;     // C(k+1,2)
     uint32_t record_cnt;
@@ -202,28 +175,64 @@ typedef struct PACKED {
 } TaskRec;
 
 /* ============================================================
-   Worker: process rank range [r0, r1) for k-subsets of [N]
+   Worker: process rank range over ONLY sets with max(A) > baseN
    ============================================================ */
 
-static int run_task_fixedk(int chunk_id, int N, int k, int total_tasks, const char *tmp_dir) {
-    const uint64_t total = binom_u64(N, k);
-    if (total == 0) {
-        fprintf(stderr, "Task %d: C(%d,%d) overflow/invalid\n", chunk_id, N, k);
-        return 2;
+static int run_task_fixedk_newonly(int chunk_id, int N, int k, int total_tasks,
+                                   int baseN, const char *tmp_dir) {
+    // total = C(N,k)
+    mpz_t total, offset, total_eff, r0, r1, tmp;
+    mpz_inits(total, offset, total_eff, r0, r1, tmp, NULL);
+
+    mpz_bin_uiui(total, (unsigned)N, (unsigned)k);
+
+    // offset = C(baseN,k) if N > baseN and baseN >= k, else 0.
+    if (N > baseN && baseN >= k) {
+        mpz_bin_uiui(offset, (unsigned)baseN, (unsigned)k);
+    } else {
+        mpz_set_ui(offset, 0);
     }
 
-    const uint64_t r0 = (total * (uint64_t)chunk_id) / (uint64_t)total_tasks;
-    const uint64_t r1 = (total * (uint64_t)(chunk_id + 1)) / (uint64_t)total_tasks;
+    // total_eff = total - offset
+    mpz_sub(total_eff, total, offset);
+    if (mpz_sgn(total_eff) <= 0) {
+        // Nothing new at this N (either N<=baseN or k>baseN and offset=0 but total maybe 0)
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
+        return 0;
+    }
 
-    const int max_sum = 2 * N;
-    const int mult_cap = (k * (k + 1)) / 2;
+    // Partition effective ranks [0, total_eff) among tasks:
+    // r0_eff = floor(total_eff * chunk_id / total_tasks)
+    // r1_eff = floor(total_eff * (chunk_id+1) / total_tasks)
+    mpz_mul_ui(tmp, total_eff, (unsigned long)chunk_id);
+    mpz_fdiv_q_ui(r0, tmp, (unsigned long)total_tasks);
 
-    // counts[add][mult] only (k fixed)
-    const size_t stride = (size_t)(mult_cap + 1);
+    mpz_mul_ui(tmp, total_eff, (unsigned long)(chunk_id + 1));
+    mpz_fdiv_q_ui(r1, tmp, (unsigned long)total_tasks);
+
+    // Convert to global ranks by adding offset: r_global = offset + r_eff
+    mpz_add(r0, r0, offset);
+    mpz_add(r1, r1, offset);
+
+    // chunk_len = r1 - r0 must fit in uint64 for looping
+    mpz_sub(tmp, r1, r0);
+    if (!mpz_fits_ulong_p(tmp)) {
+        fprintf(stderr, "Task %d: chunk length too large for uint64 loop (N=%d,k=%d)\n", chunk_id, N, k);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
+        return 2;
+    }
+    uint64_t chunk_len = (uint64_t)mpz_get_ui(tmp);
+
+    const int max_sum  = 2 * N;
+    const int mult_cap_i = (k * (k + 1)) / 2;
+
+    const size_t stride   = (size_t)(mult_cap_i + 1);
     const size_t table_sz = (size_t)(max_sum + 1) * stride;
+
     uint64_t *counts = (uint64_t *)calloc(table_sz, sizeof(uint64_t));
     if (!counts) {
         fprintf(stderr, "Task %d: failed to alloc counts (%zu)\n", chunk_id, table_sz);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
         return 2;
     }
 
@@ -231,67 +240,58 @@ static int run_task_fixedk(int chunk_id, int N, int k, int total_tasks, const ch
     if (u32vec_init(&touched, (size_t)1 << 16) != 0) {
         fprintf(stderr, "Task %d: failed to alloc touched\n", chunk_id);
         free(counts);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
         return 2;
     }
 
-    // Timestamped mark arrays: avoid clearing.
-    // sum values in [2..2N], product values in [1..N^2]
     const int prod_max = N * N;
-
     uint32_t *sum_mark  = (uint32_t *)calloc((size_t)(max_sum + 1), sizeof(uint32_t));
     uint32_t *prod_mark = (uint32_t *)calloc((size_t)(prod_max + 1), sizeof(uint32_t));
     if (!sum_mark || !prod_mark) {
         fprintf(stderr, "Task %d: failed to alloc mark arrays\n", chunk_id);
-        free(sum_mark);
-        free(prod_mark);
+        free(sum_mark); free(prod_mark);
         u32vec_free(&touched);
         free(counts);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
+        return 2;
+    }
+    uint32_t stamp = 1;
+
+    uint16_t *comb = (uint16_t *)malloc((size_t)k * sizeof(uint16_t));
+    if (!comb) {
+        fprintf(stderr, "Task %d: failed to alloc comb\n", chunk_id);
+        free(sum_mark); free(prod_mark);
+        u32vec_free(&touched);
+        free(counts);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
         return 2;
     }
 
-    uint32_t stamp = 1;
+    // Initialize at global rank r0 (already >= offset, so comb contains an element > baseN)
+    unrank_comb_lex_mpz(N, k, r0, comb);
 
-    uint8_t comb[64];
-    unrank_comb_lex(N, k, r0, comb);
-
-    for (uint64_t r = r0; r < r1; r++) {
-        // Compute |A+A|, |A*A| for current combination comb[0..k-1]
+    for (uint64_t it = 0; it < chunk_len; it++) {
         uint16_t add_card = 0;
         uint16_t mult_card = 0;
 
         stamp++;
-        if (stamp == 0) { // wrapped; reset marks (rare)
+        if (stamp == 0) {
             memset(sum_mark, 0, (size_t)(max_sum + 1) * sizeof(uint32_t));
             memset(prod_mark, 0, (size_t)(prod_max + 1) * sizeof(uint32_t));
             stamp = 1;
         }
 
         for (int i = 0; i < k; i++) {
-            const int ai = (int)comb[i];
+            int ai = (int)comb[i];
             for (int j = i; j < k; j++) {
-                const int aj = (int)comb[j];
+                int aj = (int)comb[j];
 
-                const int s = ai + aj;
-                if (sum_mark[s] != stamp) {
-                    sum_mark[s] = stamp;
-                    add_card++;
-                }
+                int s = ai + aj;
+                if (sum_mark[s] != stamp) { sum_mark[s] = stamp; add_card++; }
 
-                const int p = ai * aj;
-                if (prod_mark[p] != stamp) {
-                    prod_mark[p] = stamp;
-                    mult_card++;
-                }
+                int p = ai * aj;
+                if (prod_mark[p] != stamp) { prod_mark[p] = stamp; mult_card++; }
             }
-        }
-
-        // mult_card must be <= C(k+1,2)
-        if ((int)mult_card > mult_cap) {
-            fprintf(stderr, "Task %d: mult_card=%u > mult_cap=%d (impossible)\n", chunk_id, mult_card, mult_cap);
-            free(sum_mark); free(prod_mark);
-            u32vec_free(&touched);
-            free(counts);
-            return 2;
         }
 
         const size_t idx = (size_t)add_card * stride + (size_t)mult_card;
@@ -300,41 +300,44 @@ static int run_task_fixedk(int chunk_id, int N, int k, int total_tasks, const ch
             uint32_t key = pack_am(add_card, mult_card);
             if (u32vec_push(&touched, key) != 0) {
                 fprintf(stderr, "Task %d: touched push failed\n", chunk_id);
+                free(comb);
                 free(sum_mark); free(prod_mark);
                 u32vec_free(&touched);
                 free(counts);
+                mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
                 return 2;
             }
         }
 
-        if (r + 1 < r1) {
-            if (!next_comb_lex(comb, k, N)) break;
+        if (it + 1 < chunk_len) {
+            if (!next_comb_lex_u16(comb, k, N)) break;
         }
     }
 
+    free(comb);
     free(sum_mark);
     free(prod_mark);
 
-    // Write task binary (sparse)
     char path[4096];
-    snprintf(path, sizeof(path), "%s/tmp_N%02d_%04d.bin", tmp_dir, N, chunk_id + 1);
+    snprintf(path, sizeof(path), "%s/tmp_k%d_N%05d_%04d.bin", tmp_dir, k, N, chunk_id + 1);
 
     FILE *f = fopen(path, "wb");
     if (!f) {
         fprintf(stderr, "Task %d: failed to open %s: %s\n", chunk_id, path, strerror(errno));
         u32vec_free(&touched);
         free(counts);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
         return 3;
     }
 
     TaskHdr hdr;
     memset(&hdr, 0, sizeof(hdr));
     memcpy(hdr.magic, "SPPKBIN\0", 8);
-    hdr.version = 1;
-    hdr.N = (uint8_t)N;
-    hdr.k = (uint8_t)k;
-    hdr.max_sum = (uint16_t)max_sum;
-    hdr.mult_cap = (uint16_t)mult_cap;
+    hdr.version   = 1;
+    hdr.N         = (uint16_t)N;
+    hdr.k         = (uint16_t)k;
+    hdr.max_sum   = (uint16_t)max_sum;
+    hdr.mult_cap  = (uint16_t)mult_cap_i;
     hdr.record_cnt = (uint32_t)touched.len;
 
     if (fwrite(&hdr, sizeof(hdr), 1, f) != 1) {
@@ -342,6 +345,7 @@ static int run_task_fixedk(int chunk_id, int N, int k, int total_tasks, const ch
         fclose(f);
         u32vec_free(&touched);
         free(counts);
+        mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
         return 3;
     }
 
@@ -355,6 +359,7 @@ static int run_task_fixedk(int chunk_id, int N, int k, int total_tasks, const ch
             fclose(f);
             u32vec_free(&touched);
             free(counts);
+            mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
             return 3;
         }
     }
@@ -362,17 +367,19 @@ static int run_task_fixedk(int chunk_id, int N, int k, int total_tasks, const ch
     fclose(f);
     u32vec_free(&touched);
     free(counts);
+
+    mpz_clears(total, offset, total_eff, r0, r1, tmp, NULL);
     return 0;
 }
 
 /* ============================================================
-   Parent merge: read task files, accumulate into global counts, append to CSV
+   Merge: identical to your previous merge, except filenames match
    ============================================================ */
 
 static int merge_N_to_csv(int N, int k, const char *tmp_dir, int total_tasks, FILE *csv) {
-    const int max_sum = 2 * N;
+    const int max_sum  = 2 * N;
     const int mult_cap = (k * (k + 1)) / 2;
-    const size_t stride = (size_t)(mult_cap + 1);
+    const size_t stride   = (size_t)(mult_cap + 1);
     const size_t table_sz = (size_t)(max_sum + 1) * stride;
 
     uint64_t *counts = (uint64_t *)calloc(table_sz, sizeof(uint64_t));
@@ -383,7 +390,7 @@ static int merge_N_to_csv(int N, int k, const char *tmp_dir, int total_tasks, FI
 
     for (int chunk_id = 0; chunk_id < total_tasks; chunk_id++) {
         char path[4096];
-        snprintf(path, sizeof(path), "%s/tmp_N%02d_%04d.bin", tmp_dir, N, chunk_id + 1);
+        snprintf(path, sizeof(path), "%s/tmp_k%d_N%05d_%04d.bin", tmp_dir, k, N, chunk_id + 1);
 
         FILE *f = fopen(path, "rb");
         if (!f) {
@@ -400,7 +407,8 @@ static int merge_N_to_csv(int N, int k, const char *tmp_dir, int total_tasks, FI
             return 3;
         }
 
-        if (memcmp(hdr.magic, "SPPKBIN\0", 8) != 0 || hdr.version != 1 || hdr.N != (uint8_t)N || hdr.k != (uint8_t)k) {
+        if (memcmp(hdr.magic, "SPPKBIN\0", 8) != 0 || hdr.version != 1 ||
+            hdr.N != (uint16_t)N || hdr.k != (uint16_t)k) {
             fprintf(stderr, "Merge: bad header in %s\n", path);
             fclose(f);
             free(counts);
@@ -421,18 +429,14 @@ static int merge_N_to_csv(int N, int k, const char *tmp_dir, int total_tasks, FI
         }
 
         fclose(f);
-        // remove temp file to save disk
         unlink(path);
     }
 
-    // Append nonzero bins to CSV
     for (int add = 0; add <= max_sum; add++) {
         const size_t base = (size_t)add * stride;
         for (int mult = 0; mult <= mult_cap; mult++) {
             uint64_t c = counts[base + (size_t)mult];
-            if (c) {
-                fprintf(csv, "%d,%d,%d,%d,%" PRIu64 "\n", N, k, add, mult, c);
-            }
+            if (c) fprintf(csv, "%d,%d,%d,%d,%" PRIu64 "\n", N, k, add, mult, c);
         }
     }
 
@@ -441,12 +445,12 @@ static int merge_N_to_csv(int N, int k, const char *tmp_dir, int total_tasks, FI
 }
 
 /* ============================================================
-   Main: loop N=k..N_max, run tasks in parallel, merge, append to CSV
+   Main
    ============================================================ */
 
 int main(int argc, char **argv) {
-    if (argc != 6) {
-        fprintf(stderr, "Usage: %s <N_max> <k> <out_dir> <jobs> <chunks_per_job>\n", argv[0]);
+    if (argc != 7) {
+        fprintf(stderr, "Usage: %s <N_max> <k> <out_dir> <jobs> <chunks_per_job> <baseN>\n", argv[0]);
         return 1;
     }
 
@@ -455,29 +459,37 @@ int main(int argc, char **argv) {
     const char *out_dir = argv[3];
     const int jobs = atoi(argv[4]);
     const int chunks_per_job = atoi(argv[5]);
+    const int baseN = atoi(argv[6]);
 
-    if (k < 1 || k > 63) { fprintf(stderr, "Error: k must be in [1,63]\n"); return 1; }
-    if (N_max < k || N_max > 63) { fprintf(stderr, "Error: N_max must be in [k,63]\n"); return 1; }
+    if (k < 1) { fprintf(stderr, "Error: k must be >= 1\n"); return 1; }
+    if (N_max < k) { fprintf(stderr, "Error: N_max must be >= k\n"); return 1; }
+    if (N_max > 65535) { fprintf(stderr, "Error: N_max too large (<=65535)\n"); return 1; }
+    if (baseN < 0 || baseN > 65535) { fprintf(stderr, "Error: baseN out of range\n"); return 1; }
     if (jobs < 1) { fprintf(stderr, "Error: jobs must be >= 1\n"); return 1; }
     if (chunks_per_job < 1) { fprintf(stderr, "Error: chunks_per_job must be >= 1\n"); return 1; }
 
-    // Create output dirs
     if (mkdir_p(out_dir) != 0) {
         fprintf(stderr, "Error: could not create out_dir '%s'\n", out_dir);
         return 1;
     }
 
-    // temp directory inside out_dir
+    char out_subdir[4096];
+    snprintf(out_subdir, sizeof(out_subdir), "%s/spp_k%d", out_dir, k);
+    if (mkdir_p(out_subdir) != 0) {
+        fprintf(stderr, "Error: could not create '%s'\n", out_subdir);
+        return 1;
+    }
+
     char tmp_dir[4096];
-    snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp", out_dir);
+    snprintf(tmp_dir, sizeof(tmp_dir), "%s/tmp_k%d", out_subdir, k);
     if (mkdir_p(tmp_dir) != 0) {
         fprintf(stderr, "Error: could not create tmp dir '%s'\n", tmp_dir);
         return 1;
     }
 
-    // Open (overwrite) the final CSV
     char out_csv_path[4096];
-    snprintf(out_csv_path, sizeof(out_csv_path), "%s/spp_k_up_to_n.csv", out_dir);
+    snprintf(out_csv_path, sizeof(out_csv_path),
+             "%s/spp_k%d_up_to_n%d_new_gt_%d.csv", out_subdir, k, N_max, baseN);
 
     FILE *csv = fopen(out_csv_path, "w");
     if (!csv) {
@@ -497,14 +509,13 @@ int main(int argc, char **argv) {
     }
 
     for (int N = k; N <= N_max; N++) {
-        const double t0N = now_seconds();
-        const uint64_t total = binom_u64(N, k);
-        if (total == 0) {
-            fprintf(stderr, "Skipping N=%d: C(N,k) overflow/invalid\n", N);
+        if (N <= baseN) {
+            // Nothing to do: no k-subset of [N] can include > baseN.
             continue;
         }
 
-        // Launch at most 'jobs' children concurrently for this N.
+        const double t0N = now_seconds();
+
         int next_chunk = 0, active = 0, done = 0;
 
         while (done < total_tasks) {
@@ -513,12 +524,13 @@ int main(int argc, char **argv) {
 
                 pid_t pid = fork();
                 if (pid < 0) {
-                    fprintf(stderr, "Error: fork failed at N=%d chunk=%d: %s\n", N, chunk_id, strerror(errno));
-                    next_chunk = total_tasks; // stop launching
+                    fprintf(stderr, "Error: fork failed at N=%d chunk=%d: %s\n",
+                            N, chunk_id, strerror(errno));
+                    next_chunk = total_tasks;
                     break;
                 }
                 if (pid == 0) {
-                    int rc = run_task_fixedk(chunk_id, N, k, total_tasks, tmp_dir);
+                    int rc = run_task_fixedk_newonly(chunk_id, N, k, total_tasks, baseN, tmp_dir);
                     _exit(rc);
                 }
 
@@ -539,14 +551,11 @@ int main(int argc, char **argv) {
             int exit_code = 0;
             if (WIFEXITED(status)) exit_code = WEXITSTATUS(status);
             else exit_code = 128;
-
             if (exit_code != 0) {
                 fprintf(stderr, "Error: N=%d task failed (exit=%d)\n", N, exit_code);
-                // keep going; merge will likely fail if files missing
             }
         }
 
-        // Merge this N into CSV and delete temp files.
         int mrc = merge_N_to_csv(N, k, tmp_dir, total_tasks, csv);
         if (mrc != 0) {
             fprintf(stderr, "Error: merge failed for N=%d (rc=%d)\n", N, mrc);
@@ -559,8 +568,9 @@ int main(int argc, char **argv) {
 
         double elapsedN = now_seconds() - t0N;
         double elapsedAll = now_seconds() - t0_all;
-        printf("Finished N=%d (C=%" PRIu64 ") in %.2fs (total %.2fs). Appended to %s\n",
-               N, total, elapsedN, elapsedAll, out_csv_path);
+
+        printf("Finished N=%d (new-only max>%d) in %.2fs (total %.2fs). Appended to %s\n",
+               N, baseN, elapsedN, elapsedAll, out_csv_path);
         fflush(stdout);
     }
 
