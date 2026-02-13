@@ -7,7 +7,6 @@ from collections import Counter
 from itertools import combinations
 from pathlib import Path
 
-
 def generate_rows(n: int) -> list[tuple[int, int, int, int]]:
     try:
         from ookami import CombSet  # type: ignore
@@ -47,30 +46,12 @@ def write_csv(path: Path, rows: list[tuple[int, int, int, int]]) -> None:
         writer.writerows(rows)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Compute aggregated (|A|, |A+A|, |A*A|, count) for all subsets A of [n] "
-            "with sizes in [n-5, n], using OOKAMI."
-        )
-    )
-    parser.add_argument("n", type=int, help="n for [n] = {1, ..., n}; must be >= 7")
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=None,
-        help="Output CSV path (default: data/progressions_n<N>.csv)",
-    )
-    args = parser.parse_args()
-
-    if args.n < 7:
+def compute_data(n: int, path: str = None) -> None:
+    if n < 7:
         raise SystemExit("n must be >= 7")
 
-    output_path = args.output if args.output is not None else Path(f"data/progressions_n{args.n}.csv")
+    output_path = Path(path) if path is not None else Path(f"data/progressions_n{n}.csv")
 
-    rows = generate_rows(args.n)
+    rows = generate_rows(n)
     write_csv(output_path, rows)
 
-
-if __name__ == "__main__":
-    main()

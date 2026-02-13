@@ -135,13 +135,8 @@ def main() -> None:
         ticks = np.linspace(1.0, 2.0, 11)
         ax.set_xticks(ticks)
         ax.set_yticks(ticks)
-
-        ax.set_xlabel("Geometric Progressions  (K$_{|A|}(|A\\cdot A|)$)", fontsize=14)
-        ax.set_ylabel("Arithmetic Progressions  (K$_{|A|}(|A+A|)$)", fontsize=14)
-    else:
-        # Raw plot: |A*A| vs |A+A|.
-        ax.set_xlabel("Geometric Progressions  (|A\\cdot A|)", fontsize=14)
-        ax.set_ylabel("Arithmetic Progressions  (|A+A|)", fontsize=14)
+        ax.set_xlabel("|A+A|", fontsize=14)
+        ax.set_ylabel("|A*A|", fontsize=14)
 
     # Match the paper’s “smaller k on top” feel by drawing large k first.
     # Use a rainbow-like map for k.
@@ -159,8 +154,8 @@ def main() -> None:
 
         if args.normalized:
             m, b = params[k]
-            x = K_of(k, mult, m, b)   # x-axis: products (GP)
-            y = K_of(k, add,  m, b)   # y-axis: sums (AP)
+            x = K_of(k, add, m, b)   # x-axis: sums (AP)
+            y = K_of(k, mult,  m, b)   # y-axis: products (GP)
         else:
             x = add
             y = mult
@@ -178,7 +173,7 @@ def main() -> None:
             marker=".",
             linewidths=0,
             alpha=0.6,
-            rasterized=True,   # helps a lot if you output PDF
+            rasterized=True, 
         )
 
     # Colorbar labeled by |A|.
@@ -196,8 +191,8 @@ def main() -> None:
         x_min = float(df["add_ds_card"].min())
         x_max = float(df["add_ds_card"].max())
         # Small padding to avoid points on the border.
-        y_pad = max(1.0, 0.02 * (x_max - x_min))
-        x_pad = max(1.0, 0.02 * (y_max - y_min))
+        y_pad = max(1.0, 0.02 * (y_max - y_min))
+        x_pad = max(1.0, 0.02 * (x_max - x_min))
         ax.set_xlim(x_min - x_pad, x_max + x_pad)
         ax.set_ylim(y_min - y_pad, y_max + y_pad)
         ax.set_aspect("equal", adjustable="box")

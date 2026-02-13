@@ -42,10 +42,10 @@ def write_merged_csv(path: str, merged: dict[tuple[int, int, int], int]) -> None
 
 def main() -> int:
     base_file = "data.csv"
-    out_file = "new-data.csv"
+    out_file = "data-new.csv"
 
     merged = read_base_pairs(base_file)
-    merge_spp_files(merged, "p-adic*.csv")
+    merge_spp_files(merged, "prog*.csv")
     write_merged_csv(out_file, merged)
 
     print(f"Wrote {out_file} with {len(merged)} unique points.")
